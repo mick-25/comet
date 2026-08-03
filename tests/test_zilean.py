@@ -78,7 +78,7 @@ class ZileanScraperTests(unittest.IsolatedAsyncioTestCase):
             title="Movie",
         )
 
-        with self.assertRaisesRegex(ValueError, "Zilean result"):
+        with self.assertRaises(KeyError):
             await scraper.scrape(request)
 
     async def test_series_request_omits_only_missing_filters(self):

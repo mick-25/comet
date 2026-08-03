@@ -18,20 +18,9 @@ class TorrentsDBScraper(TorrentDiscoveryAdapter):
 
     @staticmethod
     def _parse_stream(torrent):
-        if not isinstance(torrent, dict):
-            raise ValueError("TorrentsDB result is invalid")
-
-        description = torrent.get("title")
-        info_hash = torrent.get("infoHash")
+        description = torrent["title"]
+        info_hash = torrent["infoHash"]
         sources = torrent.get("sources", [])
-        if (
-            not isinstance(description, str)
-            or not description
-            or not isinstance(info_hash, str)
-            or not info_hash
-            or not isinstance(sources, list)
-        ):
-            raise ValueError("TorrentsDB result is invalid")
 
         lines = description.split("\n")
         match = METADATA_PATTERN.search(lines[-1])
@@ -55,8 +44,4 @@ class TorrentsDBScraper(TorrentDiscoveryAdapter):
             if not is_success_status(response.status):
                 raise RuntimeError(f"HTTP {response.status}")
             results = await response.json()
-        if not isinstance(results, dict) or not isinstance(
-            results.get("streams"), list
-        ):
-            raise ValueError("TorrentsDB response is invalid")
-        return [self._parse_stream(torrent) for torrent in results["streams"]]
+        return [self._parse_stream(stream) for stream in results["streams"]]

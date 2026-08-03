@@ -33,7 +33,7 @@ from comet.discovery.capabilities import (
     record_discovery_capability_failure,
 )
 from comet.discovery.manager import DiscoveryResult
-from comet.discovery.models import MAX_TITLE_ALIASES, MediaQuery
+from comet.discovery.models import MediaQuery
 from comet.discovery.torrent_repository import torrent_candidate_from_runtime
 from comet.metadata.episode_index import EpisodeIndexService
 from comet.metadata.filter import release_filter
@@ -59,8 +59,11 @@ from comet.services.debrid_account_scraper import (
     get_account_torrents_for_media,
     schedule_account_snapshot_refresh,
 )
-from comet.services.filtering import filter_release_candidates
-from comet.services.lock import DistributedLock
+from comet.services.filtering import (
+    apply_release_candidate_policy,
+    normalize_release_candidates,
+    release_normalization_fingerprint,
+)
 from comet.services.orchestration import TorrentResultAccumulator
 from comet.services.ranking import sort_candidates
 from comet.usenet.access import NativeAccessAuthorizer
@@ -233,9 +236,7 @@ def _discovery_title_aliases(
     title: str,
     aliases: Mapping[str, list[str]],
 ) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(chain((title,), chain.from_iterable(aliases.values()))))[
-        :MAX_TITLE_ALIASES
-    ]
+    return tuple(dict.fromkeys(chain((title,), chain.from_iterable(aliases.values()))))
 
 
 async def _search_configured_sources(
@@ -248,7 +249,10 @@ async def _search_configured_sources(
     season: int | None,
     episode: int | None,
     title_aliases: tuple[str, ...] = (),
+    title: str | None = None,
+    aliases: dict[str, list[str]] | None = None,
     year: int | None = None,
+    year_end: int | None = None,
     air_date: str | None = None,
     absolute_episode: int | None = None,
     search_scope: str | None = None,
@@ -343,10 +347,35 @@ async def _search_configured_sources(
         if codec is not None
         else None
     )
+    aliases = {} if aliases is None else aliases
+
+    async def normalize_candidates(candidates: tuple[ReleaseCandidate, ...]):
+        return await normalize_release_candidates(
+            candidates,
+            title=title,
+            year=year,
+            year_end=year_end,
+            media_type=media_type,
+            aliases=aliases,
+            content_id=media_id,
+        )
+
+    normalization_fingerprint = (
+        release_normalization_fingerprint(
+            title=title,
+            year=year,
+            year_end=year_end,
+            media_type=media_type,
+            aliases=aliases,
+        )
+        if title is not None
+        else None
+    )
     result = await SearchCoordinator(
         adapters,
         database=database if account_partition is not None else None,
         background_task_adder=add_background_task,
+        candidate_normalizer=(normalize_candidates if title is not None else None),
     ).search(
         MediaQuery(
             media_id,
@@ -354,10 +383,13 @@ async def _search_configured_sources(
             season,
             episode,
             title_aliases=title_aliases,
+            title=title,
             year=year,
+            year_end=year_end,
             air_date=air_date,
             absolute_episode=absolute_episode,
             search_scope=search_scope,
+            normalization_fingerprint=normalization_fingerprint,
         ),
         plan,
         account_partition=account_partition,
@@ -378,30 +410,39 @@ async def _filter_and_rank_discovery_candidates(
     candidates: tuple,
     *,
     title: str,
-    year: int,
+    year: int | None,
     year_end: int | None,
     media_type: str,
-    aliases: dict,
+    aliases: dict[str, list[str]],
+    content_id: str,
     remove_adult_content: bool,
     config: Mapping[str, Any],
-    content_id: str | None = None,
 ) -> tuple:
-    """Run non-torrent releases through the shared RTN filter and rank rules."""
+    """Apply request policy and ranking to normalized discovery candidates."""
     if not candidates:
         return ()
-    loop = asyncio.get_running_loop()
-    filtered = await loop.run_in_executor(
-        get_executor(),
-        filter_release_candidates,
-        candidates,
-        title,
-        year,
-        year_end,
-        media_type,
-        aliases,
-        remove_adult_content,
-        content_id,
+    legacy_candidates = tuple(
+        candidate for candidate in candidates if candidate.parsed is None
     )
+    if legacy_candidates:
+        normalized_legacy = await normalize_release_candidates(
+            legacy_candidates,
+            title=title,
+            year=year,
+            year_end=year_end,
+            media_type=media_type,
+            aliases=aliases,
+            content_id=content_id,
+        )
+        candidates = (
+            tuple(candidate for candidate in candidates if candidate.parsed is not None)
+            + normalized_legacy
+        )
+    filtered = apply_release_candidate_policy(
+        candidates,
+        remove_adult_content=remove_adult_content,
+    )
+    loop = asyncio.get_running_loop()
     ranked = await loop.run_in_executor(
         get_executor(),
         sort_candidates,
@@ -537,12 +578,12 @@ async def _prepare_discovery_only_view(
     config: Mapping[str, Any],
     discovery_result: DiscoveryResult,
     *,
-    title: str,
     content_id: str,
-    year: int,
+    title: str,
+    year: int | None,
     year_end: int | None,
+    aliases: dict[str, list[str]],
     media_type: str,
-    aliases: dict,
     remove_adult_content: bool,
     season: int | None,
     episode: int | None,
@@ -557,9 +598,9 @@ async def _prepare_discovery_only_view(
         year_end=year_end,
         media_type=media_type,
         aliases=aliases,
+        content_id=content_id,
         remove_adult_content=remove_adult_content,
         config=config,
-        content_id=content_id,
     )
     return await _prepare_provider_view(
         config,
@@ -580,7 +621,6 @@ def episode_matching_policy(
     search_season: int | None,
     search_episode: int | None,
     *,
-    cached_only: bool,
     has_debrid: bool,
     enable_torrent: bool,
 ) -> tuple[bool, bool]:
@@ -590,11 +630,11 @@ def episode_matching_policy(
         and search_episode is not None
         and media_only_id.startswith("tt")
     )
-    allow_debrid_verified_season_packs = (
-        is_imdb_episode_request and cached_only and has_debrid and not enable_torrent
+    allow_debrid_season_packs = (
+        is_imdb_episode_request and has_debrid and not enable_torrent
     )
     reject_unknown_episode_files = (
-        is_imdb_episode_request and not allow_debrid_verified_season_packs
+        is_imdb_episode_request and not allow_debrid_season_packs
     )
     return is_imdb_episode_request, reject_unknown_episode_files
 
@@ -624,10 +664,10 @@ def group_debrid_entries_by_service(
         service = entry["service"]
         credential = (service, entry["apiKey"])
         configuration_id = entry.get("configurationId")
-        if not isinstance(configuration_id, str) and credential in seen_credentials:
+        if configuration_id is None and credential in seen_credentials:
             continue
         seen_credentials.add(credential)
-        key = configuration_id if isinstance(configuration_id, str) else service
+        key = service if configuration_id is None else configuration_id
         service_entries.setdefault((key, service), []).append(entry)
     return [
         (key, service, entries) for (key, service), entries in service_entries.items()
@@ -701,34 +741,23 @@ async def background_scrape(
     ip: str,
     session,
 ):
-    scrape_lock = DistributedLock(media_id)
-    lock_acquired = await scrape_lock.acquire()
+    await torrent_manager.scrape_torrents(ScrapeContext.BACKGROUND)
 
-    if not lock_acquired:
-        return
+    if debrid_entries and torrent_manager.torrents:
+        await get_and_cache_multi_service_availability(
+            session,
+            debrid_entries,
+            torrent_manager.torrents,
+            torrent_manager.media_id,
+            torrent_manager.media_only_id,
+            torrent_manager.search_season,
+            torrent_manager.search_episode,
+            torrent_manager.media_scope,
+            ip,
+            target_air_date=torrent_manager.target_air_date,
+        )
 
-    async def run_scrape():
-        await torrent_manager.scrape_torrents(ScrapeContext.BACKGROUND)
-
-        if debrid_entries and torrent_manager.torrents:
-            await get_and_cache_multi_service_availability(
-                session,
-                debrid_entries,
-                torrent_manager.torrents,
-                torrent_manager.media_id,
-                torrent_manager.media_only_id,
-                torrent_manager.search_season,
-                torrent_manager.search_episode,
-                torrent_manager.media_scope,
-                ip,
-                target_air_date=torrent_manager.target_air_date,
-            )
-
-    try:
-        await scrape_lock.run(run_scrape())
-        await _mark_scope_scraped_if_populated(media_id, torrent_manager.torrents)
-    finally:
-        await scrape_lock.release()
+    await _mark_scope_scraped_if_populated(media_id, torrent_manager.torrents)
 
 
 async def check_multi_service_availability(
@@ -801,6 +830,7 @@ async def get_and_cache_multi_service_availability(
     ip: str,
     target_air_date: str | None = None,
     known_cache_status: dict | None = None,
+    add_background_task: BackgroundTaskAdder | None = None,
 ):
     service_cache_status = defaultdict(dict)
     errors = {}
@@ -851,6 +881,7 @@ async def get_and_cache_multi_service_availability(
                     episode,
                     media_scope,
                     target_air_date=target_air_date,
+                    add_background_task=add_background_task,
                 )
                 return cached_hashes, torrent_updates, None
             except DebridAuthError as error:
@@ -1125,7 +1156,10 @@ async def _search_media(
             season=search_season,
             episode=search_episode,
             title_aliases=_discovery_title_aliases(title, aliases),
+            title=title,
+            aliases=aliases,
             year=year,
+            year_end=year_end,
             air_date=None,
             absolute_episode=search_episode if is_kitsu else None,
             search_scope=presentation_scope,
@@ -1147,12 +1181,12 @@ async def _search_media(
         ) = await _prepare_discovery_only_view(
             config,
             discovery_result,
-            title=title,
             content_id=media_id,
+            title=title,
             year=year,
             year_end=year_end,
-            media_type=media_type,
             aliases=aliases,
+            media_type=media_type,
             remove_adult_content=remove_adult_content,
             season=search_season,
             episode=search_episode,
@@ -1197,7 +1231,6 @@ async def _search_media(
         media_only_id,
         search_season,
         search_episode,
-        cached_only=bool(config["cachedOnly"]),
         has_debrid=bool(debrid_entries),
         enable_torrent=enable_torrent,
     )
@@ -1227,6 +1260,7 @@ async def _search_media(
         target_air_date=target_air_date,
         reject_unknown_episode_files=reject_unknown_episode_files,
         media_scope=media_scope,
+        cache_task_adder=add_background_task,
     )
 
     await torrent_manager.get_cached_torrents()
@@ -1245,75 +1279,10 @@ async def _search_media(
     cache_manager = CacheStateManager(media_id)
     cache_result = await cache_manager.check_and_decide(torrent_count)
     force_scrape_now = not torrent_manager.primary_cached
-    lock_acquired = cache_result.lock_acquired
     account_snapshot_ready = False
-
-    if force_scrape_now and not lock_acquired:
-        lock_acquired = await cache_manager.try_acquire_lock()
-
-    torrent_branch_locked = (force_scrape_now and not lock_acquired) or (
-        cache_result.should_return_wait_message and not force_scrape_now
-    )
+    torrent_discovery_inflight = False
     discovery_result = None
-    if torrent_branch_locked and not torrent_manager.torrents:
-        discovery_result = await discovery_task
-        (
-            candidates,
-            provider_options,
-            rendered_candidate_ids,
-            provider_capabilities,
-        ) = await _prepare_discovery_only_view(
-            config,
-            discovery_result,
-            title=title,
-            content_id=media_id,
-            year=year,
-            year_end=year_end,
-            media_type=media_type,
-            aliases=aliases,
-            remove_adult_content=remove_adult_content,
-            season=search_season,
-            episode=search_episode,
-            season_norm=presentation_season,
-            episode_norm=presentation_episode,
-        )
-        if provider_options:
-            return MediaSearchResult(
-                MediaSearchStatus.OK,
-                metadata=metadata,
-                aliases=aliases,
-                media_scope=media_scope,
-                cache_state=cache_state,
-                media_only_id=media_only_id,
-                search_season=search_season,
-                search_episode=search_episode,
-                is_torrent_only=False,
-                use_account_scrape=False,
-                candidates=candidates,
-                discovery_diagnostics=discovery_result.diagnostics,
-                provider_options=provider_options,
-                rendered_candidate_ids=rendered_candidate_ids,
-                provider_capabilities=provider_capabilities,
-                candidate_count=len(candidates),
-            )
-        return MediaSearchResult(
-            MediaSearchStatus.BUSY,
-            metadata=metadata,
-            aliases=aliases,
-            media_scope=media_scope,
-            cache_state=cache_state,
-            media_only_id=media_only_id,
-            search_season=search_season,
-            search_episode=search_episode,
-            is_torrent_only=is_torrent_only,
-            use_account_scrape=use_account_scrape,
-            discovery_diagnostics=discovery_result.diagnostics,
-        )
-    if (
-        not torrent_branch_locked
-        and cache_result.should_scrape_background
-        and not force_scrape_now
-    ):
+    if cache_result.should_scrape_background and not force_scrape_now:
         add_background_task(
             background_scrape,
             torrent_manager,
@@ -1323,21 +1292,19 @@ async def _search_media(
             session,
         )
 
-    if not torrent_branch_locked and (
-        cache_result.should_scrape_now or force_scrape_now
-    ):
-        try:
-            if use_account_scrape:
-                await asyncio.gather(
-                    torrent_manager.scrape_torrents(ScrapeContext.LIVE),
-                    ensure_account_snapshot_ready(session, debrid_entries, ip),
-                )
-                account_snapshot_ready = True
-            else:
-                await torrent_manager.scrape_torrents(ScrapeContext.LIVE)
-            await _mark_scope_scraped_if_populated(media_id, torrent_manager.torrents)
-        finally:
-            await cache_manager.release_lock()
+    if cache_result.should_scrape_now or force_scrape_now:
+        if use_account_scrape:
+            torrent_discovery_result, _ = await asyncio.gather(
+                torrent_manager.scrape_torrents(ScrapeContext.LIVE),
+                ensure_account_snapshot_ready(session, debrid_entries, ip),
+            )
+            account_snapshot_ready = True
+        else:
+            torrent_discovery_result = await torrent_manager.scrape_torrents(
+                ScrapeContext.LIVE
+            )
+        torrent_discovery_inflight = torrent_discovery_result.inflight
+        await _mark_scope_scraped_if_populated(media_id, torrent_manager.torrents)
 
     if discovery_result is None:
         discovery_result = await discovery_task
@@ -1348,9 +1315,9 @@ async def _search_media(
         year_end=year_end,
         media_type=media_type,
         aliases=aliases,
+        content_id=media_id,
         remove_adult_content=remove_adult_content,
         config=config,
-        content_id=media_id,
     )
     await torrent_manager.ingest_release_candidates(
         "configured-discovery", discovery_result.candidates
@@ -1451,6 +1418,7 @@ async def _search_media(
             ip,
             target_air_date=target_air_date,
             known_cache_status=service_cache_status,
+            add_background_task=add_background_task,
         )
         merge_service_cache_status(service_cache_status, fresh_service_cache_status)
 
@@ -1523,7 +1491,13 @@ async def _search_media(
         ]
 
     return MediaSearchResult(
-        MediaSearchStatus.OK,
+        (
+            MediaSearchStatus.BUSY
+            if torrent_discovery_inflight
+            and not ranked_info_hashes
+            and not provider_options
+            else MediaSearchStatus.OK
+        ),
         metadata=metadata,
         aliases=aliases,
         media_scope=media_scope,

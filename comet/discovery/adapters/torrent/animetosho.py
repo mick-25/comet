@@ -1,13 +1,10 @@
 import asyncio
-import re
 from urllib.parse import quote_plus
 
 from comet.core.models import settings
 from comet.core.provider_json import is_success_status
 from comet.discovery.adapters.newznab import (
     NewznabError,
-    _bounded_decimal,
-    _read_bounded,
     parse_newznab_feed,
 )
 from comet.discovery.torrent_base import (
@@ -18,9 +15,6 @@ from comet.discovery.torrent_base import (
 from comet.discovery.torrent_models import ScrapeRequest
 from comet.services.torrent_manager import extract_trackers_from_magnet
 
-_INFO_HASH = re.compile(r"[0-9a-fA-F]{40}$")
-_MAX_SIGNED_64 = (1 << 63) - 1
-_MAX_SEEDERS = (1 << 31) - 1
 _MAX_RESULTS_PER_QUERY = 1_000
 
 
@@ -35,24 +29,15 @@ class AnimeToshoScraper(TorrentDiscoveryAdapter):
         for item in items:
             title = item.fields.get("title")
             attributes = item.attributes
-            size = _bounded_decimal(
-                attributes.get("size"),
-                maximum=_MAX_SIGNED_64,
-            )
+            raw_size = attributes.get("size")
+            size = int(raw_size) if raw_size else None
             if size == 0:
                 size = None
             info_hash = attributes.get("infohash")
-            seeders = _bounded_decimal(
-                attributes.get("seeders"),
-                maximum=_MAX_SEEDERS,
-            )
+            raw_seeders = attributes.get("seeders")
+            seeders = int(raw_seeders) if raw_seeders else None
             magnet = attributes.get("magneturl")
-            if (
-                not title
-                or len(title) > 1_024
-                or info_hash is None
-                or _INFO_HASH.fullmatch(info_hash) is None
-            ):
+            if not title or info_hash is None:
                 continue
             torrents.append(
                 {
@@ -83,7 +68,7 @@ class AnimeToshoScraper(TorrentDiscoveryAdapter):
             if not is_success_status(response.status):
                 raise NewznabError("provider_response_invalid")
 
-            content = await _read_bounded(response, 2 * 1024 * 1024)
+            content = await response.read()
             if not content.strip():
                 return [], 0
 
@@ -136,7 +121,8 @@ class AnimeToshoScraper(TorrentDiscoveryAdapter):
     async def scrape(self, request: ScrapeRequest):
         semaphore = asyncio.Semaphore(settings.ANIMETOSHO_MAX_CONCURRENT_PAGES)
         results = await gather_concurrently(
-            self._scrape_query(query, semaphore) for query in request.query_titles
+            self._scrape_query(query, semaphore)
+            for query in request.scoped_query_titles()
         )
         return deduplicate_torrents(
             [torrent for torrents in results for torrent in torrents]

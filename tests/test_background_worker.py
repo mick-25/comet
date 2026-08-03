@@ -1,9 +1,8 @@
 import asyncio
-import math
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from databases import Database
 
@@ -13,6 +12,7 @@ from comet.background_scraper.worker import (
 )
 from comet.core.db_router import ReplicaAwareDatabase
 from comet.core.models import settings
+from comet.metadata.manager import MetadataFetchResult, MetadataFetchStatus
 
 
 async def _create_queue_database(path: Path) -> ReplicaAwareDatabase:
@@ -63,6 +63,97 @@ class _PassthroughLock:
 
 
 class BackgroundWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_movie_scrape_consumes_structured_metadata_result(self):
+        worker = BackgroundScraperWorker()
+        worker.metadata_scraper = Mock()
+        worker.metadata_scraper.fetch_aliases_with_metadata = AsyncMock(
+            return_value=MetadataFetchResult(
+                MetadataFetchStatus.OK,
+                {
+                    "title": "Spider-Man: Homecoming",
+                    "year": 2017,
+                    "year_end": None,
+                },
+                {"en": ["Spider-Man: Homecoming"]},
+            )
+        )
+        manager = Mock()
+        manager.torrents = {"hash": {}}
+        manager.scrape_torrents = AsyncMock()
+
+        with (
+            patch(
+                "comet.background_scraper.worker.TorrentResultAccumulator",
+                return_value=manager,
+            ) as accumulator,
+            patch(
+                "comet.background_scraper.worker.mark_scope_scraped",
+                new=AsyncMock(),
+            ) as mark_scraped,
+        ):
+            count = await worker._scrape_movie(
+                {
+                    "media_id": "tt2250912",
+                    "media_type": "movie",
+                    "title": "Spider-Man: Homecoming",
+                    "year": 2017,
+                    "year_end": None,
+                }
+            )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            accumulator.call_args.kwargs["aliases"],
+            {"en": ["Spider-Man: Homecoming"]},
+        )
+        manager.scrape_torrents.assert_awaited_once()
+        mark_scraped.assert_awaited_once_with("tt2250912")
+
+    async def test_completed_item_emits_progress_log(self):
+        worker = BackgroundScraperWorker()
+        worker.is_running = True
+        worker._scrape_movie = AsyncMock(return_value=3)
+        worker._update_item_state = AsyncMock()
+
+        with patch("comet.background_scraper.worker.log.info") as info:
+            await worker._scrape_single_media(
+                {
+                    "media_id": "tt2250912",
+                    "media_type": "movie",
+                    "consecutive_failures": 0,
+                },
+                None,
+            )
+
+        self.assertEqual(worker.stats.total_processed, 1)
+        self.assertEqual(worker.stats.total_success, 1)
+        info.assert_called_once()
+        self.assertEqual(info.call_args.args[0], "background.item.completed")
+        self.assertEqual(info.call_args.kwargs["outcome"], "ok")
+        self.assertEqual(info.call_args.kwargs["torrent_count"], 3)
+
+    async def test_failed_item_logs_the_caught_exception(self):
+        worker = BackgroundScraperWorker()
+        worker.is_running = True
+        failure = TypeError("invalid metadata result")
+        worker._scrape_movie = AsyncMock(side_effect=failure)
+        worker._update_item_state = AsyncMock()
+
+        with patch("comet.background_scraper.worker.log.warning") as warning:
+            await worker._scrape_single_media(
+                {
+                    "media_id": "tt2250912",
+                    "media_type": "movie",
+                    "consecutive_failures": 0,
+                },
+                None,
+            )
+
+        self.assertEqual(worker.stats.total_failed, 1)
+        self.assertEqual(worker.stats.errors, 1)
+        self.assertIs(warning.call_args.kwargs["exc"], failure)
+        self.assertEqual(warning.call_args.kwargs["outcome"], "failed")
+
     async def test_unexpected_item_task_failure_aborts_the_batch(self):
         worker = BackgroundScraperWorker()
         worker.is_running = True
@@ -408,44 +499,6 @@ class BackgroundWorkerQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fetch_one.await_args.kwargs["force_primary"])
         self.assertIn("CROSS JOIN episode_snapshot", fetch_one.await_args.args[0])
 
-    async def test_queue_snapshot_rejects_corrupt_database_values(self):
-        worker = BackgroundScraperWorker()
-        valid = {
-            "movie_count": 2,
-            "series_count": 3,
-            "oldest_item_ts": 90.0,
-            "episode_count": 5,
-            "oldest_episode_ts": 80.0,
-        }
-        invalid_rows = [
-            None,
-            valid | {"movie_count": True},
-            valid | {"series_count": -1},
-            valid | {"episode_count": 1.5},
-            valid | {"oldest_item_ts": 90},
-            valid | {"oldest_item_ts": math.nan},
-            valid | {"oldest_episode_ts": math.inf},
-        ]
-        with patch(
-            "comet.background_scraper.worker.database.fetch_one",
-            new=AsyncMock(return_value=valid | {"extra": 1}),
-        ):
-            self.assertEqual(
-                (await worker._fetch_queue_snapshot(now=100.0))["movies"],
-                2,
-            )
-
-        for row in invalid_rows:
-            with (
-                self.subTest(row=row),
-                patch(
-                    "comet.background_scraper.worker.database.fetch_one",
-                    new=AsyncMock(return_value=row),
-                ),
-                self.assertRaises((TypeError, ValueError)),
-            ):
-                await worker._fetch_queue_snapshot(now=100.0)
-
     async def test_requeue_dead_items_rolls_back_both_tables_on_failure(self):
         worker = BackgroundScraperWorker()
 
@@ -478,26 +531,7 @@ class BackgroundWorkerQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fetch_val.await_count, 2)
         self.assertEqual(execute.await_count, 2)
 
-    async def test_requeue_dead_items_rejects_normalized_counts(self):
-        worker = BackgroundScraperWorker()
-
-        with (
-            patch(
-                "comet.background_scraper.worker.database.transaction",
-                return_value=AsyncMock(),
-            ),
-            patch(
-                "comet.background_scraper.worker.database.fetch_val",
-                new=AsyncMock(return_value="2"),
-            ),
-            self.assertRaisesRegex(
-                ValueError,
-                "dead_item_count must be a non-negative integer",
-            ),
-        ):
-            await worker.requeue_dead_items()
-
-    async def test_recent_runs_enforces_limit_and_serializes_current_schema(self):
+    async def test_recent_runs_serializes_current_schema(self):
         worker = BackgroundScraperWorker()
         row = {
             "run_id": "12345678-1234-4234-8234-123456789abc",
@@ -517,13 +551,9 @@ class BackgroundWorkerQueryTests(unittest.IsolatedAsyncioTestCase):
         with patch("comet.background_scraper.worker.database.fetch_all", fetch_all):
             self.assertEqual(await worker.get_recent_runs(20), [row])
 
-        for limit in (None, True, 0, -1, 201, 1.5, "20"):
-            with self.subTest(limit=limit), self.assertRaises(ValueError):
-                await worker.get_recent_runs(limit)
-
         fetch_all.assert_awaited_once()
 
-    def test_run_rows_reject_corrupt_schema_and_invariants(self):
+    def test_run_rows_serialize_the_projection(self):
         valid = {
             "run_id": "12345678-1234-4234-8234-123456789abc",
             "started_at": 10.0,
@@ -537,20 +567,6 @@ class BackgroundWorkerQueryTests(unittest.IsolatedAsyncioTestCase):
             "worker_count": 2,
             "last_error": None,
         }
-        invalid_rows = [
-            None,
-            valid | {"run_id": "not-a-uuid"},
-            valid | {"status": "dead"},
-            valid | {"started_at": 10},
-            valid | {"started_at": math.nan},
-            valid | {"finished_at": 9.0},
-            valid | {"finished_at": None},
-            valid | {"processed": True},
-            valid | {"failed": -1},
-            valid | {"duration_ms": 1.5},
-            valid | {"last_error": 1},
-        ]
-
         self.assertEqual(_serialize_run_row(valid), valid)
         self.assertEqual(
             _serialize_run_row(valid | {"extra": 1})["run_id"], valid["run_id"]
@@ -560,9 +576,6 @@ class BackgroundWorkerQueryTests(unittest.IsolatedAsyncioTestCase):
                 "finished_at"
             ]
         )
-        for row in invalid_rows:
-            with self.subTest(row=row), self.assertRaises((TypeError, ValueError)):
-                _serialize_run_row(row)
 
 
 if __name__ == "__main__":

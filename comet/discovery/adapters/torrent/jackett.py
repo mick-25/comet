@@ -125,13 +125,7 @@ class JackettScraper(TorrentDiscoveryAdapter):
             if not is_success_status(response.status):
                 raise RuntimeError(f"HTTP {response.status}")
             data = decode_indexer_json(await response.read())
-            if (
-                not isinstance(data, dict)
-                or not isinstance(data.get("Results"), list)
-                or len(data["Results"]) > 10_000
-            ):
-                raise ValueError("response payload is missing a results list")
-            return data["Results"]
+            return data.get("Results", [])
 
     async def scrape(self, request: ScrapeRequest):
         indexers = active_jackett_indexers()
@@ -168,12 +162,15 @@ class JackettScraper(TorrentDiscoveryAdapter):
 
         for result_batch in batched(torrent_results, _REQUEST_BATCH_SIZE):
             processed_torrents = await gather_concurrently(
-                self.process_torrent(
-                    result,
-                    request.media_only_id,
-                    request.season,
-                )
-                for result in result_batch
+                (
+                    self.process_torrent(
+                        result,
+                        request.media_only_id,
+                        request.season,
+                    )
+                    for result in result_batch
+                ),
+                preserve_successes=True,
             )
             for sublist in processed_torrents:
                 torrents.extend(sublist)

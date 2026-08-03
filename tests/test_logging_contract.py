@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import json
 import logging
@@ -102,7 +103,7 @@ class LoggingContractTests(unittest.TestCase):
     def test_invalid_configuration_log_explains_cross_field_failure(self):
         self.configure("normal")
         try:
-            AppSettings(_env_file=None, COMETNET_ENABLED=True)
+            AppSettings(_env_file=None, USENET_ENGINE_ENABLED=True)
         except ValidationError as error:
             records = self.render(
                 lambda captured_error=error: configuration_invalid(
@@ -110,11 +111,11 @@ class LoggingContractTests(unittest.TestCase):
                 )
             )
         else:
-            self.fail("invalid CometNet topology was accepted")
+            self.fail("invalid Usenet topology was accepted")
 
         payload = json.loads(records[0])
         self.assertEqual(payload["event"], "config.invalid")
-        self.assertIn("public CometNet requires", payload["details"])
+        self.assertIn("require USENET_ENABLED", payload["details"])
 
     def test_invalid_configuration_preserves_loader_failure_diagnostic(self):
         self.configure("normal")
@@ -558,6 +559,35 @@ class LoggingContractTests(unittest.TestCase):
         self.assertEqual(payload["error_type"], "RuntimeError")
         self.assertEqual(payload["error_message"], "worker boot failed")
 
+    def test_asyncio_failure_preserves_context_and_exception(self):
+        self.configure("normal")
+        configure_stdlib_bridge()
+
+        try:
+            raise RuntimeError("task failed")
+        except RuntimeError:
+            records = self.render(
+                lambda: logging.getLogger("asyncio").exception(
+                    "Task exception was never retrieved"
+                )
+            )
+
+        payload = json.loads(records[0])
+        self.assertEqual(payload["event"], "dependency.asyncio.failed")
+        self.assertEqual(payload["details"], "Task exception was never retrieved")
+        self.assertEqual(payload["error_type"], "RuntimeError")
+        self.assertEqual(payload["error_message"], "task failed")
+
+    def test_asyncio_cancellation_is_not_reported_as_a_dependency_failure(self):
+        self.configure("normal")
+        configure_stdlib_bridge()
+
+        records = self.render(
+            lambda: logging.getLogger("asyncio").error(asyncio.CancelledError())
+        )
+
+        self.assertEqual(records, [])
+
     def test_production_rejection_is_fixed_and_does_not_raise(self):
         self.configure("normal", strict=False)
         canary = "secret\n\x1b[31m"
@@ -566,7 +596,9 @@ class LoggingContractTests(unittest.TestCase):
         if records:
             rendered = records[0].decode()
             self.assertNotIn(canary, rendered)
-            self.assertEqual(json.loads(records[0])["event"], "logging.record.rejected")
+            payload = json.loads(records[0])
+            self.assertEqual(payload["event"], "logging.record.rejected")
+            self.assertEqual(payload["failure_reason"], "event")
 
     def test_context_is_generated_and_restored(self):
         self.configure("normal")

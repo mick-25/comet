@@ -50,10 +50,10 @@ class StreamAddonScraperTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_and_payload_failures_propagate(self):
         with self.assertRaisesRegex(RuntimeError, "HTTP 404"):
             await PeerflixScraper(None, _Session({}, status=404)).scrape(REQUEST)
-        with self.assertRaisesRegex(ValueError, "Comet response"):
+        with self.assertRaises(TypeError):
             await CometScraper(None, _Session([]), "https://comet.test").scrape(REQUEST)
 
-    def test_stream_parsers_reject_missing_consumed_fields(self):
+    def test_stream_parsers_expose_missing_consumed_fields(self):
         cases = (
             (MediaFusionScraper._parse_stream, {"infoHash": "a" * 40}),
             (AiostreamsScraper._parse_stream, {"infoHash": "a" * 40}),
@@ -64,7 +64,7 @@ class StreamAddonScraperTests(unittest.IsolatedAsyncioTestCase):
         for parser, stream in cases:
             with (
                 self.subTest(parser=parser.__qualname__),
-                self.assertRaises(ValueError),
+                self.assertRaises((AttributeError, KeyError, TypeError)),
             ):
                 parser(stream)
 
@@ -281,7 +281,7 @@ class StreamAddonScraperTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([torrent["fileIndex"] for torrent in torrents], [0, 0])
 
-    async def test_seadex_malformed_result_fails_the_source_batch(self):
+    async def test_seadex_exposes_malformed_results(self):
         scraper = SeaDexScraper(None, _Session({"items": [None]}))
         with (
             patch(
@@ -292,7 +292,7 @@ class StreamAddonScraperTests(unittest.IsolatedAsyncioTestCase):
                 "comet.discovery.adapters.torrent.seadex.anime_mapper.get_anilist_id",
                 new=AsyncMock(return_value=123),
             ),
-            self.assertRaisesRegex(ValueError, "SeaDex result"),
+            self.assertRaises(TypeError),
         ):
             await scraper.scrape(REQUEST)
 

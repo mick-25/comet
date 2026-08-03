@@ -27,7 +27,10 @@ from comet.core.schema_specs import (
 from comet.discovery.repository import (
     LEGACY_TORRENT_DISCOVERY_CONFIGURATION_ID,
 )
-from comet.discovery.torrent_backfill import backfill_legacy_torrents
+from comet.discovery.torrent_backfill import (
+    _POSTGRES_IMPORT_SQL,
+    backfill_legacy_torrents,
+)
 from comet.discovery.torrent_repository import TorrentReleaseRepository
 from comet.services import orchestration, torrent_manager
 from comet.services.orchestration import TorrentResultAccumulator
@@ -49,6 +52,23 @@ DEVELOPMENT_MIGRATIONS = (
     "2026072301_media_demand_scrape_coverage",
     "2026072701_imdb_title_lookup",
 )
+
+
+class PostgresLegacyTorrentBackfillSqlTests(unittest.TestCase):
+    def test_promotes_legacy_integer_timestamps_before_millisecond_arithmetic(self):
+        legacy_cte = _POSTGRES_IMPORT_SQL.partition("grouped AS (")[0]
+
+        self.assertIn(
+            "CAST(updated_at AS DOUBLE PRECISION) AS updated_at",
+            legacy_cte,
+        )
+
+    def test_preserves_legacy_null_escapes_without_jsonb_translation(self):
+        self.assertIn(
+            "source_documents.sources_json::json",
+            _POSTGRES_IMPORT_SQL,
+        )
+        self.assertNotIn("sources_json::jsonb", _POSTGRES_IMPORT_SQL)
 
 
 class LegacyTorrentBackfillTests(unittest.IsolatedAsyncioTestCase):
@@ -160,7 +180,7 @@ class LegacyTorrentBackfillTests(unittest.IsolatedAsyncioTestCase):
         candidates = await self.database.fetch_all(
             """
             SELECT media_id, scope, season_norm, episode_norm, transport,
-                   release_key, attributes_json
+                   release_key, parsed_json, attributes_json
             FROM release_candidates
             ORDER BY media_id
             """,
@@ -205,6 +225,9 @@ class LegacyTorrentBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [row["release_key"] for row in candidates],
             ["btih:" + "a" * 40, "btih:" + "b" * 40],
+        )
+        self.assertTrue(
+            all(orjson.loads(row["parsed_json"])["raw_title"] for row in candidates)
         )
         self.assertEqual(len(locators), 3)
         self.assertTrue(all(row["locator_kind"] == "torrent" for row in locators))

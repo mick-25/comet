@@ -48,21 +48,9 @@ class DebridioScraper(TorrentDiscoveryAdapter):
 
     @staticmethod
     def _parse_stream(torrent):
-        if not isinstance(torrent, dict):
-            raise ValueError("Debridio result is invalid")
-
-        title_full = torrent.get("title")
-        url = torrent.get("url")
-        if (
-            not isinstance(title_full, str)
-            or not title_full
-            or not isinstance(url, str)
-        ):
-            raise ValueError("Debridio result is invalid")
-
+        title_full = torrent["title"]
+        url = torrent["url"]
         url_parts = url.split("/")
-        if len(url_parts) < 2 or not url_parts[-2]:
-            raise ValueError("Debridio result is invalid")
 
         match = DATA_PATTERN.search(title_full)
         size_str = match.group(1) if match else None
@@ -98,8 +86,4 @@ class DebridioScraper(TorrentDiscoveryAdapter):
             if not is_success_status(response.status):
                 raise RuntimeError(f"HTTP {response.status}")
             results = await response.json()
-        if not isinstance(results, dict) or not isinstance(
-            results.get("streams"), list
-        ):
-            raise ValueError("Debridio response is invalid")
-        return [self._parse_stream(torrent) for torrent in results["streams"]]
+        return [self._parse_stream(stream) for stream in results["streams"]]

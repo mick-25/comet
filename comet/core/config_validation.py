@@ -1,10 +1,12 @@
-import base64
 import json
-import re
 from functools import lru_cache
 
 from pydantic import ValidationError
 
+from comet.core.config_codec import (
+    decode_configuration_segment,
+    encode_configuration_segment,
+)
 from comet.core.credentials import api_credential
 from comet.core.models import (
     ConfigModel,
@@ -60,12 +62,11 @@ def _normalize_v2_torrent_providers(
     """Resolve canonical v2 torrent providers from their account envelopes."""
     if "bittorrent" not in (config.get("enabledTransports") or ()):
         return [], False
-    accounts = config.get("accounts")
-    accounts = accounts if isinstance(accounts, dict) else {}
+    accounts = config.get("accounts") or {}
     normalized = []
     direct_enabled = False
     for provider in config.get("playbackProviders") or ():
-        if not isinstance(provider, dict) or not provider.get("enabled"):
+        if not provider.get("enabled"):
             continue
         kind = provider.get("kind")
         if kind not in TORRENT_PROVIDER_KINDS:
@@ -74,13 +75,7 @@ def _normalize_v2_torrent_providers(
             direct_enabled = True
             continue
         account_id = provider.get("accountId")
-        credential = (
-            api_credential(accounts.get(account_id))
-            if isinstance(account_id, str)
-            else None
-        )
-        if not isinstance(credential, str) or not credential:
-            raise ValueError("enabled debrid provider has no account credential")
+        credential = api_credential(accounts.get(account_id)) or ""
         normalized.append(
             {
                 "configurationId": provider["configurationId"],
@@ -100,24 +95,19 @@ _DEFAULT_VALIDATED_CONFIG["_debridEntries"] = []
 _DEFAULT_VALIDATED_CONFIG["_enableTorrent"] = True
 _DEFAULT_OPTIONS = default_config["options"]
 
-_MAX_CONFIG_SEGMENT_BYTES = 32 * 1024
-_MAX_CONFIG_JSON_BYTES = 24 * 1024
-_CONFIG_BASE64 = re.compile(r"^(?:[A-Za-z0-9+/]+={0,2}|[A-Za-z0-9_-]+={0,2})$")
-
-
 def _reject_nonfinite_json_constant(_value):
     raise ValueError("non-finite JSON number")
+
+
+class _ValidatedConfiguration(dict):
+    def __init__(self, config: dict, url_segment: str):
+        super().__init__(config)
+        self.url_segment = url_segment
 
 
 def normalize_validated_config(validated_config: dict) -> dict:
     """Build the runtime representation shared by every configuration entrypoint."""
     options = _DEFAULT_OPTIONS | (validated_config["options"] or {})
-    if (
-        type(options["allow_english_in_languages"]) is not bool
-        or type(options["remove_unknown_languages"]) is not bool
-    ):
-        raise ValueError("configuration options are invalid")
-
     validated_config["options"] = {
         "allow_english_in_languages": options["allow_english_in_languages"],
         "remove_unknown_languages": options["remove_unknown_languages"],
@@ -165,35 +155,23 @@ def normalize_validated_config(validated_config: dict) -> dict:
 
 @lru_cache(maxsize=512)
 def _parse_and_validate_config(b64config: str):
-    if not isinstance(b64config, str):
-        return None
     try:
-        encoded_size = len(b64config.encode("ascii"))
-    except UnicodeEncodeError:
-        return None
-    if (
-        encoded_size > _MAX_CONFIG_SEGMENT_BYTES
-        or len(b64config) % 4 == 1
-        or _CONFIG_BASE64.fullmatch(b64config) is None
-    ):
-        return None
-    try:
-        padded = b64config + "=" * (-len(b64config) % 4)
-        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
-        if len(decoded) > _MAX_CONFIG_JSON_BYTES:
-            return None
+        decoded = decode_configuration_segment(b64config)
         config = json.loads(
             decoded.decode("utf-8"),
             parse_constant=_reject_nonfinite_json_constant,
         )
-    except ValueError:
+    except (UnicodeDecodeError, ValueError):
         return None
     try:
         validated_config = ConfigModel.model_validate(config).model_dump()
     except ValidationError:
         return None
     try:
-        return normalize_validated_config(validated_config)
+        return _ValidatedConfiguration(
+            normalize_validated_config(validated_config),
+            encode_configuration_segment(decoded),
+        )
     except ValueError:
         return None
 
@@ -203,3 +181,10 @@ def config_check(b64config: str | None):
         return _default_validated_config()
 
     return _parse_and_validate_config(b64config)
+
+
+def configuration_url_segment(config: dict, original_segment: str) -> str:
+    """Return the cached shortest URL segment for a validated configuration."""
+    if isinstance(config, _ValidatedConfiguration):
+        return config.url_segment
+    return encode_configuration_segment(decode_configuration_segment(original_segment))

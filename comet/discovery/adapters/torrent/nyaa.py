@@ -38,21 +38,18 @@ def extract_torrent_data(html_content: str):
         if magnet_match is None and title_match is None:
             continue
         if not magnet_match or not size_match or not seeders_match or not title_match:
-            raise ValueError("Nyaa result is incomplete")
+            continue
 
         magnet = html.unescape(magnet_match.group(1))
         info_hash_match = INFO_HASH_PATTERN.search(magnet)
         if not info_hash_match:
-            raise ValueError("Nyaa magnet has no valid info hash")
+            continue
         try:
             size_bytes = size_to_bytes(size_match.group(1).replace("iB", "B"))
             seeders = int(seeders_match.group(1))
         except (TypeError, ValueError):
-            raise ValueError("Nyaa result has invalid numeric fields") from None
+            continue
         info_hash = normalize_info_hash(info_hash_match.group(1))
-        if re.fullmatch(r"[0-9a-f]{40}", info_hash) is None:
-            raise ValueError("Nyaa magnet has no valid info hash")
-
         torrents.append(
             {
                 "title": html.unescape(title_match.group(1)),
@@ -136,7 +133,7 @@ class NyaaScraper(TorrentDiscoveryAdapter):
         semaphore = asyncio.Semaphore(settings.NYAA_MAX_CONCURRENT_PAGES)
         results = await gather_concurrently(
             get_all_nyaa_pages(self.session, query, semaphore)
-            for query in request.query_titles
+            for query in request.scoped_query_titles()
         )
         for result in results:
             torrents.extend(result)

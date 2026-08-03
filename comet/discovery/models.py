@@ -4,9 +4,6 @@ from dataclasses import dataclass, field
 from comet.core.scrape import ScrapeContext
 from comet.core.sources import ReleaseCandidate, ReleaseScope
 
-MAX_TITLE_ALIASES = 64
-MAX_TITLE_ALIAS_BYTES = 1024
-
 
 @dataclass(frozen=True)
 class MediaQuery:
@@ -24,6 +21,7 @@ class MediaQuery:
     title: str | None = None
     year_end: int | None = None
     search_titles: tuple[str, ...] = ()
+    normalization_fingerprint: str | None = None
 
     @property
     def scope(self) -> ReleaseScope:
@@ -64,3 +62,4 @@ class DiscoveryBatch:
     candidates: tuple[ReleaseCandidate, ...] = ()
     diagnostics: tuple[str, ...] = ()
     coverage: frozenset[str] = field(default_factory=frozenset)
+    inflight: bool = False

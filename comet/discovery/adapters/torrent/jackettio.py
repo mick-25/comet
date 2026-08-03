@@ -18,18 +18,8 @@ class JackettioScraper(TorrentDiscoveryAdapter):
 
     @staticmethod
     def _parse_stream(torrent):
-        if not isinstance(torrent, dict):
-            raise ValueError("Jackettio result is invalid")
-
-        title_full = torrent.get("title")
-        info_hash = torrent.get("infoHash")
-        if (
-            not isinstance(title_full, str)
-            or not title_full
-            or not isinstance(info_hash, str)
-            or not info_hash
-        ):
-            raise ValueError("Jackettio result is invalid")
+        title_full = torrent["title"]
+        info_hash = torrent["infoHash"]
 
         match = data_pattern.search(title_full)
         size = size_to_bytes(match.group(1)) if match else None
@@ -52,8 +42,4 @@ class JackettioScraper(TorrentDiscoveryAdapter):
             if not is_success_status(response.status):
                 raise RuntimeError(f"HTTP {response.status}")
             results = await response.json()
-        if not isinstance(results, dict) or not isinstance(
-            results.get("streams"), list
-        ):
-            raise ValueError("Jackettio response is invalid")
-        return [self._parse_stream(torrent) for torrent in results["streams"]]
+        return [self._parse_stream(stream) for stream in results["streams"]]

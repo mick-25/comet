@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from dataclasses import replace
 from tempfile import TemporaryDirectory
@@ -28,6 +29,7 @@ from comet.core.sources import (
     TorrentLocator,
     TransportKind,
 )
+from comet.discovery import manager as discovery_manager
 from comet.discovery.capabilities import DiscoveryBranchFingerprint
 from comet.discovery.manager import SearchCoordinator
 from comet.discovery.models import DiscoveryBatch, MediaQuery
@@ -161,7 +163,7 @@ class SearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "adapter is unavailable"):
+        with self.assertRaises(KeyError):
             await SearchCoordinator({}).search(MediaQuery("tt1", "movie"), plan)
 
     def test_release_candidate_requires_typed_transport(self):
@@ -243,12 +245,13 @@ class SearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ).search(MediaQuery("tt1", "movie"), plan, trace_id="trace-safe")
 
         self.assertTrue(observed.is_set())
+        self.assertTrue(result.inflight)
         self.assertEqual(
             result.diagnostics,
             ("Discovery is temporarily unavailable",),
         )
 
-    async def test_result_cardinality_and_diagnostics_are_bounded(self):
+    async def test_result_cardinality_and_diagnostics_are_preserved(self):
         plan = _torrent_plan("indexer")
         adapter = FakeAdapter(
             DiscoveryBatch(
@@ -266,14 +269,13 @@ class SearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch("comet.discovery.manager.MAX_DISCOVERY_CANDIDATES", 2):
-            result = await SearchCoordinator({"indexer": adapter}).search(
-                MediaQuery("tt1", "movie"),
-                plan,
-            )
+        result = await SearchCoordinator({"indexer": adapter}).search(
+            MediaQuery("tt1", "movie"),
+            plan,
+        )
 
-        self.assertEqual(len(result.candidates), 2)
-        self.assertEqual(result.diagnostics, ("bounded diagnostic",))
+        self.assertEqual(len(result.candidates), 4)
+        self.assertEqual(result.diagnostics, adapter.batch.diagnostics)
 
     async def test_malformed_candidate_surfaces_as_an_internal_contract_failure(self):
         plan = CapabilityPlan(
@@ -292,10 +294,6 @@ class SearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await SearchCoordinator(
                 {"indexer": FakeAdapter(DiscoveryBatch(candidates=(object(),)))}
             ).search(MediaQuery("tt1", "movie"), plan)
-
-    def test_rejects_unbounded_deadline(self):
-        with self.assertRaisesRegex(ValueError, "deadline is invalid"):
-            SearchCoordinator({}, hard_timeout=61)
 
 
 class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
@@ -323,11 +321,17 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await self.database.disconnect()
         self.temporary_directory.cleanup()
 
-    def coordinator(self, adapter, background_task_adder=None):
+    def coordinator(
+        self,
+        adapter,
+        background_task_adder=None,
+        candidate_normalizer=None,
+    ):
         return SearchCoordinator(
             {self.source_id: adapter},
             database=self.database,
             background_task_adder=background_task_adder,
+            candidate_normalizer=candidate_normalizer,
             hard_timeout=1,
         )
 
@@ -365,6 +369,35 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             fresh.candidates[0].candidate_id,
             _torrent_candidate().candidate_id,
         )
+
+    async def test_oversized_source_is_bounded_before_persistence(self):
+        base = _torrent_candidate()
+        candidates = tuple(
+            replace(
+                base,
+                candidate_id=f"candidate-{index}",
+                title=f"release-{index}",
+                locators=(
+                    replace(
+                        base.locators[0],
+                        locator_id=f"torrent-{index}",
+                        info_hash=f"{index + 1:040x}",
+                    ),
+                ),
+            )
+            for index in range(4)
+        )
+        adapter = FakeAdapter(
+            DiscoveryBatch(
+                candidates=candidates,
+                coverage=frozenset({"bittorrent"}),
+            )
+        )
+
+        result = await self.search(self.coordinator(adapter))
+
+        self.assertEqual(len(result.candidates), 4)
+        self.assertEqual(len(adapter.contexts), 1)
 
     async def test_stale_branch_returns_immediately_and_schedules_one_refresh(self):
         adapter = FakeAdapter(
@@ -467,12 +500,97 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             sorted((TransportKind.BITTORRENT, TransportKind.USENET)),
         )
 
+    async def test_concurrent_cold_searches_share_local_singleflight(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        lock_attempts = 0
+        normalization_count = 0
+        acquire = DistributedLock.acquire
+
+        async def observed_acquire(lock, *args, **kwargs):
+            nonlocal lock_attempts
+            lock_attempts += 1
+            return await acquire(lock, *args, **kwargs)
+
+        class DelayedAdapter(FakeAdapter):
+            async def search(self, query, context):
+                self.contexts.append(context)
+                started.set()
+                await release.wait()
+                return self.batch
+
+        adapter = DelayedAdapter(
+            DiscoveryBatch(
+                candidates=(_torrent_candidate(),),
+                coverage=frozenset({"bittorrent"}),
+            )
+        )
+
+        async def normalize(candidates):
+            nonlocal normalization_count
+            normalization_count += 1
+            return candidates
+
+        with patch.object(DistributedLock, "acquire", new=observed_acquire):
+            coordinator = self.coordinator(
+                adapter,
+                candidate_normalizer=normalize,
+            )
+            first = asyncio.create_task(self.search(coordinator))
+            await started.wait()
+            second = asyncio.create_task(self.search(coordinator))
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        self.assertEqual(lock_attempts, 1)
+        self.assertEqual(len(adapter.contexts), 1)
+        self.assertEqual(normalization_count, 1)
+        self.assertTrue(all(len(result.candidates) == 1 for result in results))
+
+    async def test_cancelled_waiter_does_not_cancel_shared_local_work(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class DelayedAdapter(FakeAdapter):
+            async def search(self, query, context):
+                self.contexts.append(context)
+                started.set()
+                await release.wait()
+                self.assert_context_active = not context.cancelled()
+                return self.batch
+
+        adapter = DelayedAdapter(
+            DiscoveryBatch(
+                candidates=(_torrent_candidate(),),
+                coverage=frozenset({"bittorrent"}),
+            )
+        )
+        first = asyncio.create_task(self.search(self.coordinator(adapter)))
+        await started.wait()
+        second = asyncio.create_task(self.search(self.coordinator(adapter)))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        release.set()
+        result = await second
+
+        self.assertTrue(adapter.assert_context_active)
+        self.assertEqual(len(adapter.contexts), 1)
+        self.assertEqual(len(result.candidates), 1)
+
     async def test_concurrent_cold_searches_share_database_singleflight(self):
         started = asyncio.Event()
         release = asyncio.Event()
         second_lock_attempt = asyncio.Event()
         lock_attempts = 0
+        normalization_count = 0
         acquire = DistributedLock.acquire
+
+        async def bypass_local(_key, factory):
+            return await factory()
 
         async def observed_acquire(lock, *args, **kwargs):
             nonlocal lock_attempts
@@ -494,7 +612,61 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 coverage=frozenset({"bittorrent"}),
             )
         )
-        with patch.object(DistributedLock, "acquire", new=observed_acquire):
+
+        async def normalize(candidates):
+            nonlocal normalization_count
+            normalization_count += 1
+            return candidates
+
+        with (
+            patch.object(discovery_manager._local_singleflight, "run", bypass_local),
+            patch.object(DistributedLock, "acquire", new=observed_acquire),
+        ):
+            first = asyncio.create_task(
+                self.search(self.coordinator(adapter, candidate_normalizer=normalize))
+            )
+            await started.wait()
+            second = asyncio.create_task(
+                self.search(self.coordinator(adapter, candidate_normalizer=normalize))
+            )
+            await second_lock_attempt.wait()
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        self.assertEqual(lock_attempts, 2)
+        self.assertEqual(len(adapter.contexts), 1)
+        self.assertEqual(normalization_count, 1)
+        self.assertTrue(all(len(result.candidates) == 1 for result in results))
+
+    async def test_concurrent_failure_does_not_cascade_retries(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        second_lock_attempt = asyncio.Event()
+        lock_attempts = 0
+        acquire = DistributedLock.acquire
+
+        async def bypass_local(_key, factory):
+            return await factory()
+
+        async def observed_acquire(lock, *args, **kwargs):
+            nonlocal lock_attempts
+            lock_attempts += 1
+            if lock_attempts == 2:
+                second_lock_attempt.set()
+            return await acquire(lock, *args, **kwargs)
+
+        class FailingAdapter(FakeAdapter):
+            async def search(self, query, context):
+                self.contexts.append(context)
+                started.set()
+                await release.wait()
+                raise RuntimeError("outage")
+
+        adapter = FailingAdapter()
+        with (
+            patch.object(discovery_manager._local_singleflight, "run", bypass_local),
+            patch.object(DistributedLock, "acquire", new=observed_acquire),
+        ):
             first = asyncio.create_task(self.search(self.coordinator(adapter)))
             await started.wait()
             second = asyncio.create_task(self.search(self.coordinator(adapter)))
@@ -502,8 +674,34 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             results = await asyncio.gather(first, second)
 
+        self.assertEqual(lock_attempts, 2)
         self.assertEqual(len(adapter.contexts), 1)
-        self.assertTrue(all(len(result.candidates) == 1 for result in results))
+        self.assertTrue(all(result.candidates == () for result in results))
+        self.assertTrue(
+            any(
+                "Discovery source is temporarily unavailable" in result.diagnostics
+                for result in results
+            )
+        )
+
+    async def test_successful_empty_search_uses_short_coverage_ttl(self):
+        adapter = FakeAdapter(DiscoveryBatch(coverage=frozenset({"bittorrent"})))
+        coordinator = self.coordinator(adapter)
+
+        first = await self.search(coordinator)
+        second = await self.search(coordinator)
+
+        self.assertEqual(first.candidates, ())
+        self.assertEqual(second.candidates, ())
+        self.assertEqual(len(adapter.contexts), 1)
+        coverage = await self.database.fetch_one(
+            "SELECT next_refresh_at FROM search_coverage"
+        )
+        self.assertLessEqual(coverage["next_refresh_at"] - time.time(), 30)
+
+        await self.database.execute("UPDATE search_coverage SET next_refresh_at = 0")
+        await self.search(coordinator)
+        self.assertEqual(len(adapter.contexts), 2)
 
     async def test_initial_failure_honors_retry_backoff(self):
         adapter = FakeAdapter(error=RuntimeError("outage"))
@@ -527,6 +725,21 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await self.database.execute("UPDATE search_coverage SET next_refresh_at = 0")
         await self.search(coordinator)
         self.assertEqual(len(adapter.contexts), 2)
+
+    async def test_initial_timeout_honors_retry_backoff(self):
+        adapter = FakeAdapter(error=TimeoutError())
+        coordinator = self.coordinator(adapter)
+
+        first = await self.search(coordinator)
+        waiting = await self.search(coordinator)
+        failure = await self.database.fetch_one(
+            "SELECT freshness_state FROM search_coverage"
+        )
+
+        self.assertTrue(first.inflight)
+        self.assertFalse(waiting.inflight)
+        self.assertEqual(failure["freshness_state"], "failed")
+        self.assertEqual(len(adapter.contexts), 1)
 
     async def test_public_branch_cache_is_shared_without_cross_owner_destruction(self):
         adapter = FakeAdapter(

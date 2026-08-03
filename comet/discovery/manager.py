@@ -1,9 +1,12 @@
 """Transport-neutral discovery orchestration for configured source branches."""
 
 import asyncio
+import threading
 import time
-from collections.abc import Callable, Mapping
+import weakref
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from typing import TypeVar
 
 from comet.core.capabilities import CapabilityPlan
 from comet.core.scrape import ScrapeContext
@@ -11,28 +14,16 @@ from comet.core.sources import ReleaseCandidate, TransportKind
 from comet.discovery.base import DiscoveryAdapter
 from comet.discovery.capabilities import DiscoveryBranchFingerprint
 from comet.discovery.coverage import SearchCoverageRepository, query_fingerprint
-from comet.discovery.models import DiscoveryBatch, DiscoveryContext, MediaQuery
+from comet.discovery.models import (
+    DiscoveryBatch,
+    DiscoveryContext,
+    MediaQuery,
+)
 from comet.discovery.repository import ReleaseDiscoveryRepository
 from comet.observability import log
 from comet.services.lock import DistributedLock
 
-MAX_DISCOVERY_CANDIDATES = 10_000
-MAX_DISCOVERY_DIAGNOSTICS = 64
-MAX_DISCOVERY_DIAGNOSTIC_BYTES = 512
-
-
-def _bounded_diagnostic(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        size = len(value.encode("utf-8"))
-    except UnicodeEncodeError:
-        return None
-    if not 1 <= size <= MAX_DISCOVERY_DIAGNOSTIC_BYTES or any(
-        ord(character) < 32 or ord(character) == 127 for character in value
-    ):
-        return None
-    return value
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +31,7 @@ class DiscoveryResult:
     candidates: tuple[ReleaseCandidate, ...]
     diagnostics: tuple[str, ...]
     capability_plan: CapabilityPlan
+    inflight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +41,43 @@ class _ScheduledSearch:
     branches: tuple[str, ...]
     started: float
     operation: asyncio.Task
+
+
+class _LocalSingleFlight:
+    """Collapse identical work inside one event loop without owning its cache."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tasks = weakref.WeakKeyDictionary()
+
+    def _discard(self, loop, key: str, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+        with self._lock:
+            tasks = self._tasks.get(loop)
+            if tasks is None or tasks.get(key) is not task:
+                return
+            tasks.pop(key, None)
+            if not tasks:
+                self._tasks.pop(loop, None)
+
+    async def run(self, key: str, factory: Callable[[], Awaitable[_T]]) -> _T:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            tasks = self._tasks.setdefault(loop, {})
+            task = tasks.get(key)
+            if task is None:
+                task = loop.create_task(factory())
+                tasks[key] = task
+                task.add_done_callback(
+                    lambda completed, loop=loop, key=key: self._discard(
+                        loop, key, completed
+                    )
+                )
+        return await asyncio.shield(task)
+
+
+_local_singleflight = _LocalSingleFlight()
 
 
 class SearchCoordinator:
@@ -61,29 +90,24 @@ class SearchCoordinator:
         hard_timeout: float = 8.0,
         database=None,
         background_task_adder: Callable | None = None,
+        candidate_normalizer: (
+            Callable[
+                [tuple[ReleaseCandidate, ...]],
+                Awaitable[tuple[ReleaseCandidate, ...]],
+            ]
+            | None
+        ) = None,
         fresh_ttl: float = 900.0,
+        empty_ttl: float = 30.0,
         retry_ttl: float = 60.0,
     ):
-        if (
-            isinstance(hard_timeout, bool)
-            or not isinstance(hard_timeout, (int, float))
-            or not 0 < hard_timeout <= 60
-        ):
-            raise ValueError("discovery deadline is invalid")
-        if (
-            isinstance(fresh_ttl, bool)
-            or isinstance(retry_ttl, bool)
-            or not isinstance(fresh_ttl, (int, float))
-            or not isinstance(retry_ttl, (int, float))
-            or not 1 <= fresh_ttl <= 86_400
-            or not 1 <= retry_ttl <= fresh_ttl
-        ):
-            raise ValueError("discovery cache TTLs are invalid")
         self._adapters = dict(adapters)
         self._hard_timeout = float(hard_timeout)
         self._database = database
         self._background_task_adder = background_task_adder
+        self._candidate_normalizer = candidate_normalizer
         self._fresh_ttl = float(fresh_ttl)
+        self._empty_ttl = float(empty_ttl)
         self._retry_ttl = float(retry_ttl)
 
     async def search(
@@ -106,11 +130,6 @@ class SearchCoordinator:
             for source in capability_plan.discovery
             if source.display_name
         }
-        if any(
-            source.configuration_id not in self._adapters
-            for source in capability_plan.discovery
-        ):
-            raise ValueError("planned discovery adapter is unavailable")
         scheduled: list[_ScheduledSearch] = []
         for source in capability_plan.discovery:
             adapter = self._adapters[source.configuration_id]
@@ -179,6 +198,7 @@ class SearchCoordinator:
         candidates = []
         diagnostics = []
         had_failures = False
+        had_inflight = False
         for source in scheduled:
             operation = source.operation
             failure_outcome = None
@@ -186,6 +206,7 @@ class SearchCoordinator:
             if operation in pending or operation.cancelled():
                 response = None
                 failure_outcome = "timeout"
+                had_inflight = True
             else:
                 try:
                     response = operation.result()
@@ -194,13 +215,8 @@ class SearchCoordinator:
                     failure_exception = exc
                 if failure_exception is not None:
                     failure_outcome = "failed"
-                elif any(
-                    candidate.transport not in capability_plan.transports
-                    for candidate in response.candidates
-                ):
-                    raise ValueError(
-                        "discovery adapter returned a candidate outside its plan"
-                    )
+                else:
+                    had_inflight = had_inflight or response.inflight
             if failure_outcome is not None:
                 had_failures = True
                 log.warning(
@@ -220,14 +236,9 @@ class SearchCoordinator:
                 duration_ms=(loop.time() - source.started) * 1000,
             )
             for diagnostic in response.diagnostics:
-                bounded = _bounded_diagnostic(diagnostic)
-                if bounded is not None and bounded not in diagnostics:
-                    diagnostics.append(bounded)
-                if len(diagnostics) == MAX_DISCOVERY_DIAGNOSTICS:
-                    break
+                if diagnostic not in diagnostics:
+                    diagnostics.append(diagnostic)
             for candidate in response.candidates:
-                if len(candidates) == MAX_DISCOVERY_CANDIDATES:
-                    break
                 if any(
                     capability_plan.compatible_providers(locator)
                     for locator in candidate.locators
@@ -244,6 +255,7 @@ class SearchCoordinator:
             tuple(candidates),
             tuple(diagnostics),
             capability_plan,
+            inflight=had_inflight and not candidates,
         )
 
     async def _search_source(
@@ -262,7 +274,7 @@ class SearchCoordinator:
         work_class: ScrapeContext,
     ) -> DiscoveryBatch:
         if not use_cache:
-            return await adapter.search(
+            response = await adapter.search(
                 query,
                 _context(
                     branches,
@@ -274,6 +286,7 @@ class SearchCoordinator:
                     work_class,
                 ),
             )
+            return await self._normalize_batch(response)
         branch_pairs = tuple(
             (
                 branch,
@@ -289,6 +302,7 @@ class SearchCoordinator:
         candidates = []
         diagnostics = []
         covered = set()
+        inflight = False
         cold_tasks = []
         coverage_repository = SearchCoverageRepository(self._database)
         release_repository = ReleaseDiscoveryRepository(self._database)
@@ -327,22 +341,20 @@ class SearchCoordinator:
             if effective.state == "failed_wait":
                 diagnostics.append("Discovery source is temporarily unavailable")
                 continue
-            if effective.state == "stale":
-                if self._background_task_adder is not None:
-                    self._background_task_adder(
-                        self._refresh_branch,
-                        adapter,
-                        source_configuration_id,
-                        branch,
-                        identity,
-                        query,
-                        account_partition,
-                        hard_deadline,
-                        asyncio.Event(),
-                        trace_id,
-                        False,
-                        ScrapeContext.BACKGROUND,
-                    )
+            if effective.state == "stale" and self._background_task_adder is not None:
+                self._background_task_adder(
+                    self._refresh_branch,
+                    adapter,
+                    source_configuration_id,
+                    branch,
+                    identity,
+                    query,
+                    account_partition,
+                    hard_deadline,
+                    trace_id,
+                    False,
+                    ScrapeContext.BACKGROUND,
+                )
                 continue
             cold_tasks.append(
                 asyncio.create_task(
@@ -354,7 +366,6 @@ class SearchCoordinator:
                         query,
                         account_partition,
                         hard_deadline,
-                        cancellation,
                         trace_id,
                         True,
                         work_class,
@@ -367,10 +378,12 @@ class SearchCoordinator:
                 candidates.extend(batch.candidates)
                 diagnostics.extend(batch.diagnostics)
                 covered.update(batch.coverage)
+                inflight = inflight or batch.inflight
         return DiscoveryBatch(
             tuple(candidates),
             tuple(diagnostics),
             frozenset(covered),
+            inflight,
         )
 
     async def _refresh_branch(
@@ -382,15 +395,53 @@ class SearchCoordinator:
         query: MediaQuery,
         account_partition: bytes,
         hard_deadline: float,
-        cancellation: asyncio.Event,
         trace_id: str | None,
         wait_for_lock: bool,
         work_class: ScrapeContext,
     ) -> DiscoveryBatch:
+        lock_key = (
+            "discovery:"
+            + query_fingerprint(query)
+            + ":"
+            + identity.fingerprint
+            + ":"
+            + work_class.value
+        )
+        return await _local_singleflight.run(
+            f"{id(self._database)}:{lock_key}",
+            lambda: self._refresh_branch_distributed(
+                adapter,
+                source_configuration_id,
+                branch,
+                identity,
+                query,
+                account_partition,
+                hard_deadline,
+                trace_id,
+                wait_for_lock,
+                work_class,
+                lock_key,
+            ),
+        )
+
+    async def _refresh_branch_distributed(
+        self,
+        adapter: DiscoveryAdapter,
+        source_configuration_id: str,
+        branch: str,
+        identity: DiscoveryBranchFingerprint,
+        query: MediaQuery,
+        account_partition: bytes,
+        hard_deadline: float,
+        trace_id: str | None,
+        wait_for_lock: bool,
+        work_class: ScrapeContext,
+        lock_key: str,
+    ) -> DiscoveryBatch:
         repository = ReleaseDiscoveryRepository(self._database)
         coverage_repository = SearchCoverageRepository(self._database)
         lock = DistributedLock(
-            "discovery:" + query_fingerprint(query) + ":" + identity.fingerprint,
+            lock_key,
             timeout=max(10.0, self._hard_timeout + 2.0),
             retry_interval=0.1,
             database=self._database,
@@ -405,14 +456,15 @@ class SearchCoordinator:
             return DiscoveryBatch(
                 diagnostics=(
                     ("Discovery refresh is already running",) if wait_for_lock else ()
-                )
+                ),
+                inflight=wait_for_lock,
             )
         try:
             effective = await coverage_repository.effective(
                 query,
                 identity.fingerprint,
             )
-            if effective.state == "fresh":
+            if effective.state in {"fresh", "stale_wait"}:
                 cached = await repository.load_active(
                     query,
                     identity.fingerprint,
@@ -421,20 +473,60 @@ class SearchCoordinator:
                     public_visibility=identity.public_visibility,
                 )
                 return DiscoveryBatch(cached, coverage=frozenset({branch}))
-            response = await adapter.search(
-                query,
-                _context(
-                    (branch,),
-                    source_configuration_id,
-                    (None if identity.public_visibility else account_partition),
-                    hard_deadline,
-                    cancellation,
-                    trace_id,
-                    work_class,
-                ),
-            )
-            if not isinstance(response, DiscoveryBatch):
-                raise ValueError("discovery adapter returned an invalid batch")
+            if effective.state == "failed_wait":
+                return DiscoveryBatch(
+                    diagnostics=("Discovery source is temporarily unavailable",)
+                )
+
+            cancellation = asyncio.Event()
+            provider_name = (
+                getattr(adapter, "discovery_name", None)
+                or type(adapter)
+                .__name__.removesuffix("Scraper")
+                .removesuffix("Adapter")
+            )[:128]
+
+            async def refresh():
+                refresh_started = loop.time()
+                log.info(
+                    "discovery.refresh.started",
+                    "Discovery source scrape started",
+                    provider_name=provider_name,
+                    source_type=branch,
+                    operation=work_class.value,
+                )
+                try:
+                    response = await adapter.search(
+                        query,
+                        _context(
+                            (branch,),
+                            source_configuration_id,
+                            (None if identity.public_visibility else account_partition),
+                            hard_deadline,
+                            cancellation,
+                            trace_id,
+                            work_class,
+                        ),
+                    )
+                    response = await self._normalize_batch(response)
+                    log.info(
+                        "discovery.refresh.completed",
+                        "Discovery source scrape completed",
+                        provider_name=provider_name,
+                        source_type=branch,
+                        operation=work_class.value,
+                        candidate_count=len(response.candidates),
+                        duration_ms=(loop.time() - refresh_started) * 1000,
+                    )
+                    return response
+                finally:
+                    cancellation.set()
+
+            remaining = max(0.0, hard_deadline - loop.time())
+            if remaining == 0:
+                return DiscoveryBatch(inflight=True)
+            async with asyncio.timeout(remaining):
+                response = await lock.run(refresh())
             if branch not in response.coverage:
                 await coverage_repository.record_failure(
                     query,
@@ -456,7 +548,8 @@ class SearchCoordinator:
                 owner_configuration_partition=account_partition,
                 account_partition=account_partition,
                 public_visibility=identity.public_visibility,
-                next_refresh_at=time.time() + self._fresh_ttl,
+                next_refresh_at=time.time()
+                + (self._fresh_ttl if branch_candidates else self._empty_ttl),
             )
             canonical_candidates = await repository.load_active(
                 query,
@@ -472,6 +565,13 @@ class SearchCoordinator:
             )
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            await coverage_repository.record_failure(
+                query,
+                identity.fingerprint,
+                next_refresh_at=time.time() + self._retry_ttl,
+            )
+            return DiscoveryBatch(inflight=True)
         except Exception:
             await coverage_repository.record_failure(
                 query,
@@ -481,6 +581,12 @@ class SearchCoordinator:
             raise
         finally:
             await lock.release()
+
+    async def _normalize_batch(self, response: DiscoveryBatch) -> DiscoveryBatch:
+        if self._candidate_normalizer is None or not response.candidates:
+            return response
+        candidates = await self._candidate_normalizer(response.candidates)
+        return replace(response, candidates=candidates)
 
 
 def _branch_identity(

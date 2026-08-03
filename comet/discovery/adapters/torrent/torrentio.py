@@ -19,20 +19,9 @@ class TorrentioScraper(TorrentDiscoveryAdapter):
 
     @staticmethod
     def _parse_stream(torrent):
-        if not isinstance(torrent, dict):
-            raise ValueError("Torrentio result is invalid")
-
-        title_full = torrent.get("title")
-        info_hash = torrent.get("infoHash")
+        title_full = torrent["title"]
+        info_hash = torrent["infoHash"]
         sources = torrent.get("sources", [])
-        if (
-            not isinstance(title_full, str)
-            or not title_full
-            or not isinstance(info_hash, str)
-            or not info_hash
-            or not isinstance(sources, list)
-        ):
-            raise ValueError("Torrentio result is invalid")
 
         if "\n💾" in title_full:
             title = title_full.split("\n💾")[0].split("\n")[-1]
@@ -61,8 +50,4 @@ class TorrentioScraper(TorrentDiscoveryAdapter):
             if not is_success_status(response.status):
                 raise RuntimeError(f"HTTP {response.status}")
             results = await response.json()
-        if not isinstance(results, dict) or not isinstance(
-            results.get("streams"), list
-        ):
-            raise ValueError("Torrentio response is invalid")
-        return [self._parse_stream(torrent) for torrent in results["streams"]]
+        return [self._parse_stream(stream) for stream in results["streams"]]

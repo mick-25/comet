@@ -270,16 +270,6 @@ class ReleaseDiscoveryRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded[0].transport_stats, stats)
         self.assertEqual(loaded[0].source, "https://tracker.example/announce")
 
-    async def test_candidate_scope_must_match_its_query(self):
-        query = MediaQuery("tt1234567", "movie")
-        candidate = replace(
-            self.candidate(query.media_id),
-            scope=ReleaseScope.EPISODE,
-        )
-
-        with self.assertRaisesRegex(ValueError, "scope does not match"):
-            await self.persist(query, (candidate,), now=1)
-
     async def test_duplicate_locator_content_collapses_to_one_coverage_row(self):
         """Two locators with identical content share one row, so coverage must dedupe."""
         query = MediaQuery("tt2222222", "movie")

@@ -4,6 +4,7 @@ from comet.core.provider_json import is_success_status
 from comet.discovery.torrent_base import TorrentDiscoveryAdapter
 from comet.discovery.torrent_models import ScrapeRequest
 from comet.services.anime import anime_mapper
+from comet.utils.formatting import normalize_info_hash
 
 
 class StremthruScraper(TorrentDiscoveryAdapter):
@@ -39,18 +40,17 @@ class StremthruScraper(TorrentDiscoveryAdapter):
                 attr_name = attr.get("name")
                 attr_value = attr.get("value")
                 if attr_name == "size":
-                    size = int(attr_value)
+                    try:
+                        size = int(attr_value)
+                    except (TypeError, ValueError):
+                        size = None
                 elif attr_name == "infohash":
                     info_hash = attr_value
                 elif attr_name == "indexername" and attr_value:
                     indexer_name = attr_value
-            if (
-                not isinstance(title, str)
-                or not title
-                or not isinstance(info_hash, str)
-                or not info_hash
-            ):
-                raise ValueError("StremThru result is invalid")
+            if info_hash is None:
+                continue
+            info_hash = normalize_info_hash(info_hash)
             tracker = "StremThru" + (f"|{indexer_name}" if indexer_name else "")
             torrents.append(
                 {

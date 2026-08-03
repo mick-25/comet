@@ -74,5 +74,5 @@ class TorrentioScraperTests(unittest.IsolatedAsyncioTestCase):
             title="Movie",
         )
 
-        with self.assertRaisesRegex(ValueError, "Torrentio result"):
+        with self.assertRaises(KeyError):
             await scraper.scrape(request)

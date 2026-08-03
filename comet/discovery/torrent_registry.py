@@ -1,10 +1,16 @@
+import hashlib
 import importlib
 import inspect
 import pkgutil
 from pathlib import Path
 
+import orjson
+
+from comet.core.discovery_sources import instance_discovery_source_id
 from comet.core.models import settings
 from comet.core.scrape import ScrapeContext, normalize_scraper_name
+from comet.core.settings_catalog import build_settings_catalog
+from comet.discovery.capabilities import DiscoveryBranchFingerprint
 from comet.discovery.torrent_base import TorrentDiscoveryAdapter
 from comet.discovery.torrent_models import ScrapeRequest
 from comet.services.anime import anime_mapper
@@ -15,12 +21,15 @@ from comet.utils.parsing import (
     url_mode_matches_context,
 )
 
+SERVER_TORRENT_ACCOUNT_PARTITION = hashlib.sha256(
+    b"comet-server-torrent-public-partition-v1"
+).digest()
+
 
 class TorrentAdapterRegistry:
     def __init__(self):
         self.adapter_types: dict[str, type[TorrentDiscoveryAdapter]] = {}
         self.discover_adapters()
-        self._validate_timeout_overrides()
 
     def discover_adapters(self) -> None:
         """Discover the server-configured torrent DiscoveryAdapter classes."""
@@ -41,19 +50,6 @@ class TorrentAdapterRegistry:
                     and obj is not TorrentDiscoveryAdapter
                 ):
                     self.adapter_types[obj.__name__] = obj
-
-    def _validate_timeout_overrides(self) -> None:
-        available = {normalize_scraper_name(name) for name in self.adapter_types}
-        configured = {
-            selector.partition(":")[0]
-            for selector in settings.SCRAPER_TIMEOUT_OVERRIDES
-        }
-        unknown = sorted(configured - available)
-        if unknown:
-            raise ValueError(
-                "SCRAPER_TIMEOUT_OVERRIDES contains unknown scrapers: "
-                + ", ".join(unknown)
-            )
 
     @staticmethod
     def _resolve_timeout(
@@ -79,7 +75,7 @@ class TorrentAdapterRegistry:
     @staticmethod
     def _resolve_url_for_context(url: str, context: str):
         parsed_url, mode = parse_url_scrape_mode(url)
-        if not url_mode_matches_context(mode, context):
+        if not parsed_url or not url_mode_matches_context(mode, context):
             return None
         return parsed_url
 
@@ -106,40 +102,42 @@ class TorrentAdapterRegistry:
                 if not is_anime_content:
                     continue
 
-            scrape_timeout = self._resolve_timeout(scraper_class, request.context)
+            url_credentials_pairs = None
+            if scraper_class.url_setting is not None:
+                credential_setting = scraper_class.credential_setting
+                url_credentials_pairs = [
+                    (resolved_url, credentials)
+                    for url, credentials in associate_urls_credentials(
+                        settings.__dict__[scraper_class.url_setting],
+                        (
+                            settings.__dict__[credential_setting]
+                            if credential_setting is not None
+                            else None
+                        ),
+                    )
+                    if (
+                        resolved_url := self._resolve_url_for_context(
+                            url, request.context
+                        )
+                    )
+                    is not None
+                ]
+                if not url_credentials_pairs:
+                    continue
 
-            # Get client wrapper
+            scrape_timeout = self._resolve_timeout(scraper_class, request.context)
             client = network_manager.get_client(
                 scraper_name=scraper_name_clean, impersonate=scraper_class.impersonate
             )
 
-            if scraper_class.credential_setting is not None:
-                url_credentials_pairs = associate_urls_credentials(
-                    settings.__dict__[scraper_class.url_setting],
-                    settings.__dict__[scraper_class.credential_setting],
-                )
+            if url_credentials_pairs is not None:
                 self._register_url_adapters(
                     adapters,
                     scraper_name_clean,
                     scraper_class,
                     client,
                     scrape_timeout,
-                    request.context,
                     url_credentials_pairs,
-                )
-            elif scraper_class.url_setting is not None:
-                urls = settings.__dict__[scraper_class.url_setting]
-                if isinstance(urls, str):
-                    urls = [urls]
-
-                self._register_url_adapters(
-                    adapters,
-                    scraper_name_clean,
-                    scraper_class,
-                    client,
-                    scrape_timeout,
-                    request.context,
-                    ((url, None) for url in urls),
                 )
             else:
                 scraper = scraper_class(self, client)
@@ -151,6 +149,47 @@ class TorrentAdapterRegistry:
                 )
         return adapters
 
+    @staticmethod
+    def branch_fingerprints(
+        adapters: dict[str, TorrentDiscoveryAdapter],
+        context: ScrapeContext,
+    ) -> dict[tuple[str, str], DiscoveryBranchFingerprint]:
+        """Bind shared source coverage to the effective server configuration."""
+
+        catalog = {entry.key: entry.category for entry in build_settings_catalog()}
+        configuration = settings.model_dump(mode="json")
+        source_configuration = {
+            key: value
+            for key, value in configuration.items()
+            if catalog.get(key) in {"scrapers_proxies", "discovery_indexers"}
+            or key.startswith("DMM_")
+        }
+        generation = hashlib.sha256(
+            b"comet-server-torrent-settings-v1\0"
+            + orjson.dumps(source_configuration, option=orjson.OPT_SORT_KEYS)
+        ).digest()
+        result = {}
+        for configuration_id, adapter in adapters.items():
+            fingerprint = hashlib.sha256(
+                b"comet-server-torrent-branch-v1\0"
+                + generation
+                + b"\0"
+                + configuration_id.encode("utf-8")
+                + b"\0"
+                + type(adapter).__module__.encode("utf-8")
+                + b"."
+                + type(adapter).__qualname__.encode("utf-8")
+                + b"\0"
+                + context.value.encode("ascii")
+            ).hexdigest()
+            result[(configuration_id, "bittorrent")] = DiscoveryBranchFingerprint(
+                configuration_id,
+                "bittorrent",
+                fingerprint,
+                public_visibility=True,
+            )
+        return result
+
     def _register_url_adapters(
         self,
         adapters,
@@ -158,16 +197,12 @@ class TorrentAdapterRegistry:
         scraper_class,
         client,
         scrape_timeout,
-        context,
         url_credentials,
     ) -> None:
-        active_instance_count = 0
-        for url, credentials in url_credentials:
-            parsed_url = self._resolve_url_for_context(url, context)
-            if parsed_url is None:
-                continue
-            active_instance_count += 1
-            args = (self, client, parsed_url)
+        for active_instance_count, (url, credentials) in enumerate(
+            url_credentials, start=1
+        ):
+            args = (self, client, url)
             if scraper_class.credential_setting is not None:
                 args += (credentials,)
             scraper = scraper_class(*args)
@@ -185,13 +220,13 @@ class TorrentAdapterRegistry:
         adapter: TorrentDiscoveryAdapter,
         timeout: float,
     ) -> None:
-        configuration_id = "server-torrent:" + normalize_scraper_name(
+        source_key = "server-torrent:" + normalize_scraper_name(
             display_name.partition(" #")[0]
         )
+        configuration_id = instance_discovery_source_id(source_key)
         suffix = 2
-        base_id = configuration_id
         while configuration_id in adapters:
-            configuration_id = f"{base_id}:{suffix}"
+            configuration_id = instance_discovery_source_id(f"{source_key}:{suffix}")
             suffix += 1
         adapter.discovery_name = display_name
         adapter.discovery_timeout = timeout

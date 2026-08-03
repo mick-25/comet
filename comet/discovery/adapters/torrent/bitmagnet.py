@@ -16,8 +16,7 @@ class BitmagnetScraper(TorrentDiscoveryAdapter):
     def parse_items(self, root):
         torrents = []
         for item in root.findall(".//item"):
-            title_node = item.find("title")
-            title = title_node.text if title_node is not None else None
+            title = item.find("title").text
             size = None
             info_hash = None
             seeders = None
@@ -33,13 +32,8 @@ class BitmagnetScraper(TorrentDiscoveryAdapter):
                     info_hash = attr_value
                 elif attr_name == "seeders":
                     seeders = int(attr_value)
-            if (
-                not isinstance(title, str)
-                or not title
-                or not isinstance(info_hash, str)
-                or not info_hash
-            ):
-                raise ValueError("Bitmagnet result is invalid")
+            if info_hash is None:
+                continue
             torrents.append(
                 {
                     "title": title,
@@ -73,7 +67,7 @@ class BitmagnetScraper(TorrentDiscoveryAdapter):
                 raise RuntimeError(f"HTTP {response.status}")
             data_text = await response.text()
         if not data_text.strip():
-            raise ValueError("Bitmagnet response is invalid")
+            return []
         return self.parse_items(ET.fromstring(data_text))
 
     async def scrape(self, request: ScrapeRequest):

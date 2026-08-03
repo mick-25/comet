@@ -7,10 +7,10 @@ from comet.usenet.file_selection import (
     catalog_archive_members,
     catalog_archive_volume_groups,
     catalog_engine_source_assets,
-    eligible_video_assets,
     catalog_nested_archive_members,
     catalog_par2_assets,
     catalog_par2_source_assets,
+    eligible_video_assets,
     select_archive_volume_group,
     select_archive_volume_groups,
     select_asset,
@@ -116,6 +116,15 @@ def test_episode_selection_handles_packs_multi_episode_and_ambiguity():
         select_asset(assets + (assets[1],), (1, 1, 2))
     with pytest.raises(FileSelectionError, match="file_selection_ambiguous"):
         select_asset(assets, (1, 3, 9))
+
+
+def test_episode_selection_accepts_one_engine_classified_obfuscated_video():
+    assets = catalog_engine_source_assets(
+        ARTIFACT,
+        [_asset("4SWP1OuyjO8INluR1P8jjywt6dd7Zg3M.mkv")],
+    )
+
+    assert select_asset(assets, (1, 14, 2)) == assets[0]
 
 
 def test_anime_absolute_and_explicit_asset_selection_are_exact():
