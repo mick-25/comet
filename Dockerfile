@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:0.11.32 AS uv
 
-FROM node:24-bookworm-slim AS frontend-builder
+FROM node:24.21.0-bookworm-slim AS frontend-builder
 
 WORKDIR /app/frontend
 
@@ -9,16 +9,16 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 COPY frontend ./
 RUN npm run build:assets
 
-FROM rust:1.97.1-slim-trixie AS rust-toolchain
+FROM rust:1.82.0-slim-trixie AS rust-toolchain
 
-FROM python:3.13-slim-trixie AS par2-tool
+FROM python:3.13.2-slim-trixie AS par2-tool
 
 ARG TARGETARCH
 COPY deployment/build_download.py deployment/install_par2.py /tmp/deployment/
 RUN PYTHONPATH=/tmp python -m deployment.install_par2 --arch "${TARGETARCH}" --output /opt/par2 \
     && test "$(/opt/par2/bin/par2 -V)" = "par2cmdline-turbo version 1.4.0"
 
-FROM python:3.13-slim-trixie AS libarchive-tool
+FROM python:3.13.2-slim-trixie AS libarchive-tool
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install \
@@ -60,7 +60,7 @@ RUN PYTHONPATH=/tmp python -m deployment.install_libarchive --output /opt/libarc
     && mkdir -p /opt/libarchive/share/doc \
     && cp -a /opt/libarchive-build/share/doc/libarchive /opt/libarchive/share/doc/
 
-FROM python:3.13-slim-trixie AS python-builder
+FROM python:3.13.2-slim-trixie AS python-builder
 
 COPY --from=uv /uv /uvx /bin/
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
@@ -94,7 +94,7 @@ COPY native/usenet-engine/Cargo.toml native/usenet-engine/Cargo.lock ./native/us
 COPY native/usenet-engine/src ./native/usenet-engine/src
 RUN cargo build --locked --release --manifest-path native/usenet-engine/Cargo.toml
 
-FROM python:3.13-slim-trixie AS runtime
+FROM python:3.13.2-slim-trixie AS runtime
 
 LABEL name="Comet" \
       description="Stremio's fastest torrent/debrid/usenet search add-on." \
